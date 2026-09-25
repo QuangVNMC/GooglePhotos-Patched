@@ -50,18 +50,10 @@ jobs:
           pip install beautifulsoup4 curl_cffi playwright
           playwright install chromium --with-deps
 
-
       - name: Cache Gradle
         uses: burrunan/gradle-cache-action@v3
         with:
           build-root-directory: morphe-google-photos
-
-      - name: Overlay Custom Patches from GooglePhotos-Patched into morphe-google-photos
-        run: |
-          if [ -d "custom-patches" ]; then
-            echo "Copying custom-patches into morphe-google-photos..."
-            cp -r custom-patches/* morphe-google-photos/
-          fi
 
       - name: Build Morphe Patches from morphe-google-photos
         env:
@@ -82,6 +74,18 @@ jobs:
           echo "PATCH_PATH=$PATCH_FILE" >> $GITHUB_ENV
           echo "Found patch file: $PATCH_FILE"
 
+      - name: Discover Supported Photos Versions from Patch Bundle
+        id: supported_versions
+        run: |
+          SUPPORTED=$(python .github/scripts/get_supported_versions.py "${{ env.PATCH_PATH }}")
+          if [ -z "$SUPPORTED" ]; then
+            echo "::error::Could not extract supported versions from ${{ env.PATCH_PATH }}"
+            echo "::error::Check that the patch bundle still targets com.google.android.apps.photos."
+            exit 1
+          fi
+          echo "Supported Google Photos versions declared by the patch bundle: $SUPPORTED"
+          echo "SUPPORTED_VERSIONS=$SUPPORTED" >> $GITHUB_ENV
+
       - name: Setup Morphe CLI
         run: |
           CLI_URL=$(curl -s https://api.github.com/repos/MorpheApp/morphe-desktop/releases/latest | grep "browser_download_url.*morphe-desktop.*all.jar" | cut -d '"' -f 4 | head -n 1)
@@ -91,14 +95,26 @@ jobs:
           echo "Downloading Morphe Desktop CLI from $CLI_URL"
           curl -L -o morphe-cli.jar "$CLI_URL"
 
+      # ------------------------------------------------------------------
+      # Download — tries arm64-only variant first, falls back to universal.
+      # Passes the supported-version list discovered from the .mpp so the
+      # download always matches what the patch bundle can actually apply.
+      # Writes APK_ARCH=arm64-only|universal|unknown to $GITHUB_ENV.
+      # ------------------------------------------------------------------
       - name: Download Google Photos APK
         id: download_apk
         run: |
           DIRECT_URL="${{ inputs.direct_apk_url }}"
           if [ -n "$DIRECT_URL" ]; then
             python .github/scripts/download_apk.py --direct-url "$DIRECT_URL" --output google-photos-base.apk
+            # download_apk.py already writes APK_ARCH=unknown for direct URLs,
+            # but echo it explicitly in case the script's env-write path is skipped.
+            echo "APK_ARCH=${APK_ARCH:-unknown}" >> $GITHUB_ENV
           else
-            python .github/scripts/download_apk.py --retries 3 --output google-photos-base.apk
+            python .github/scripts/download_apk.py \
+              --retries 3 \
+              --supported-versions "${{ env.SUPPORTED_VERSIONS }}" \
+              --output google-photos-base.apk
           fi
 
       - name: Extract Actual APK Version
@@ -129,7 +145,6 @@ jobs:
         run: |
           echo "🧩 [1/2] Building Mod Package (app.morphe.android.apps.photos)..."
           java -jar morphe-cli.jar patch \
-            -f \
             -p "${{ env.PATCH_PATH }}" \
             -d "Custom Morphe branding" \
             --unsigned \
@@ -138,7 +153,6 @@ jobs:
 
           echo "🧩 [2/2] Building Original Package (com.google.android.apps.photos)..."
           java -jar morphe-cli.jar patch \
-            -f \
             -p "${{ env.PATCH_PATH }}" \
             -e "Change to official package name" \
             -e "Disable Play Store updates" \
@@ -147,11 +161,42 @@ jobs:
             -o patched-original-unsigned.apk \
             google-photos-base.apk
 
+      # ------------------------------------------------------------------
+      # Strip — only runs when we had to fall back to the universal APK.
+      # Idempotent: no-ops if the APK already contains only lib/arm64-v8a/.
+      # ------------------------------------------------------------------
+      - name: Strip non-arm64-v8a Native Libraries
+        if: |
+          steps.check_release.outputs.skip != 'true'
+          && env.APK_ARCH != 'arm64-only'
+        run: |
+          echo "APK_ARCH=${{ env.APK_ARCH }} — stripping non-arm64 libs from patched APKs"
+          python .github/scripts/strip_arch.py \
+            patched-mod-unsigned.apk \
+            patched-original-unsigned.apk
+
       - name: Sign Patched APKs
         if: steps.check_release.outputs.skip != 'true'
         run: |
-          # Decode keystore from secret
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+          # Decode keystore from secret (strip any whitespace/newlines)
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "::error::KEYSTORE_BASE64 secret is empty or not configured."
+            echo "::error::Set it in Settings → Secrets and variables → Actions."
+            echo "::error::Generate with: base64 -w0 release.keystore"
+            exit 1
+          fi
+          printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | tr -d '[:space:]' | base64 -d > release.keystore
+
+          # Validate the keystore actually loads before signing
+          if [ ! -s release.keystore ]; then
+            echo "::error::release.keystore is empty after base64 decode."
+            exit 1
+          fi
+          if ! keytool -list -keystore release.keystore -storepass android >/dev/null 2>&1; then
+            echo "::error::release.keystore is not a valid PKCS#12/JKS keystore."
+            echo "::error::Re-generate the secret with: base64 -w0 release.keystore"
+            exit 1
+          fi
 
           # Determine version string and sanitize trailing dots
           APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
@@ -159,8 +204,15 @@ jobs:
           if [ -z "$APK_VER" ]; then
             APK_VER="build-${{ github.run_number }}"
           fi
-          OUT_MOD="GooglePhotos-v${APK_VER}-mod.apk"
-          OUT_ORIGINAL="GooglePhotos-v${APK_VER}-original.apk"
+
+          # Tag arm64-only builds distinctly so users can tell them apart.
+          ARCH_SUFFIX=""
+          if [ "${{ env.APK_ARCH }}" = "arm64-only" ] || [ "${{ env.APK_ARCH }}" = "universal" ] || [ "${{ env.APK_ARCH }}" = "unknown" ]; then
+            ARCH_SUFFIX="-arm64"
+          fi
+
+          OUT_MOD="GooglePhotos-v${APK_VER}${ARCH_SUFFIX}-mod.apk"
+          OUT_ORIGINAL="GooglePhotos-v${APK_VER}${ARCH_SUFFIX}-original.apk"
           echo "RELEASE_APK_MOD=${OUT_MOD}" >> $GITHUB_ENV
           echo "RELEASE_APK_ORIGINAL=${OUT_ORIGINAL}" >> $GITHUB_ENV
           echo "RELEASE_VERSION=${APK_VER}" >> $GITHUB_ENV
@@ -179,7 +231,7 @@ jobs:
             TARGET_OUT=$([ "$FLAVOR" = "mod" ] && echo "$OUT_MOD" || echo "$OUT_ORIGINAL")
             $BUILD_TOOLS_DIR/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out "${TARGET_OUT}" patched-${FLAVOR}-aligned.apk
           done
-          
+
           # Clean up decrypted keystore
           rm -f release.keystore
 
@@ -203,7 +255,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v${{ env.RELEASE_VERSION }}"
-          TITLE="Google Photos v${{ env.RELEASE_VERSION }}"
+          TITLE="Google Photos v${{ env.RELEASE_VERSION }} (arm64-v8a)"
           APK_MOD="${{ env.RELEASE_APK_MOD }}"
           APK_ORIGINAL="${{ env.RELEASE_APK_ORIGINAL }}"
 
@@ -215,4 +267,3 @@ jobs:
             echo "Creating new release $TAG..."
             gh release create "$TAG" "$APK_MOD" "$APK_ORIGINAL" --title "$TITLE" --latest
           fi
-

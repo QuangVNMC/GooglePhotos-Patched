@@ -1,10 +1,35 @@
 #!/usr/bin/env python3
 """
 Download Google Photos APK from APKMirror.
+
 Strategy:
   1. Fast path: curl_cffi with Chrome TLS impersonation (no overhead).
   2. Fallback: Playwright headless Chromium — executes the real Cloudflare JS
      challenge and carries the resulting cookies through all APKMirror steps.
+
+Architecture strategy (outer → inner):
+  A. Try the arm64-v8a-only APKMirror variant first. If it exists and downloads,
+     the resulting APK is already single-ABI — no post-processing needed.
+     On success we write APK_ARCH=arm64-only to $GITHUB_ENV.
+  B. If (A) fails at every transport (direct, playwright), fall back to the
+     universal variant (all four ABIs). On success we write APK_ARCH=universal
+     so the workflow can run strip_arch.py to drop non-arm64 native libs.
+
+Version filtering:
+  The Morphe patch bundle declares a specific set of Google Photos versions it
+  is compatible with (see `compatiblePackages` in the patch sources). Any other
+  version causes morphe-cli to skip every patch, silently producing an
+  unpatched APK. To prevent that, we only download versions from the list
+  passed via --supported-versions. The workflow computes that list by running
+  get_supported_versions.py against the freshly built .mpp.
+
+  Pass --allow-any-version to disable this protection (debugging only).
+  If --supported-versions is omitted, DEFAULT_SUPPORTED_VERSIONS is used so the
+  script remains usable standalone.
+
+Transports per URL:
+  1. curl_cffi (fast, may 403 on CI datacenter IPs).
+  2. Playwright headless Chromium (slower, survives Cloudflare).
 """
 import sys
 import os
@@ -26,11 +51,40 @@ except ImportError:
     print("beautifulsoup4 not installed. Run: pip install beautifulsoup4 curl_cffi playwright")
     sys.exit(1)
 
+# ---------------------------------------------------------------------------
+# Variant URLs
+# ---------------------------------------------------------------------------
+
+# Preferred: arm64-v8a only. APKMirror only exposes this when the uploader
+# published a per-ABI variant — not guaranteed for every release.
+ARM64_VARIANT_URL = (
+    "https://www.apkmirror.com/apk/google-inc/photos/"
+    "variant-%7B%22dpis_slug%22%3A%5B%22nodpi%22%5D%2C"
+    "%22arches_slug%22%3A%5B%22arm64-v8a%22%5D%7D/"
+)
+
+# Fallback: universal (all four ABIs). Cleaned up later by strip_arch.py.
 DEFAULT_VARIANT_URL = (
     "https://www.apkmirror.com/apk/google-inc/photos/"
     "variant-%7B%22dpis_slug%22%3A%5B%22nodpi%22%5D%2C"
     "%22arches_slug%22%3A%5B%22arm64-v8a%22%2C%22armeabi-v7a%22%2C%22x86%22%2C%22x86_64%22%5D%7D/"
 )
+
+# ---------------------------------------------------------------------------
+# Supported Google Photos versions (fallback only)
+#
+# The workflow normally computes this list from the .mpp by running
+# get_supported_versions.py and passing --supported-versions. These defaults
+# exist so download_apk.py remains usable standalone, and so a missing
+# --supported-versions argument never silently allows an incompatible download.
+#
+# Keep these in sync with the patch bundle whenever you regenerate it manually
+# and run the script outside of CI.
+# ---------------------------------------------------------------------------
+DEFAULT_SUPPORTED_VERSIONS = [
+    "7.93.0.982110057",
+    "7.92.0.977185651",
+]
 
 IMPERSONATE = "chrome131"
 
@@ -125,8 +179,19 @@ def _parse_version_tuple(ver_str):
     return tuple(int(p) for p in parts) if parts else (0,)
 
 
-def _find_detail_link(soup):
-    """Return (detail_link, version_str) for the highest semantic version on the page."""
+def _find_detail_link(soup, supported_versions=None):
+    """Return (detail_link, version_str).
+
+    When supported_versions is provided, only releases whose version string is
+    an exact member of that set are considered, and the highest of those is
+    returned. This is what keeps the download in lockstep with the Morphe
+    patch bundle's `compatiblePackages`.
+
+    When supported_versions is None, the highest version on the page is
+    returned (old pre-filter behaviour).
+
+    Returns (None, None) if nothing suitable is found.
+    """
     containers = soup.find_all("div", class_=re.compile(r"list-widget|widget-area|table-row"))
     candidates = containers if containers else [soup]
     found = []
@@ -149,12 +214,28 @@ def _find_detail_link(soup):
     if not found:
         return None, None
 
-    # Sort by semantic version descending so the highest version (e.g. 7.90.0 > 7.89.0) is always chosen
+    page_versions = sorted({f[1] for f in found}, key=_parse_version_tuple, reverse=True)
+
+    if supported_versions:
+        supported_set = set(supported_versions)
+        matches = [f for f in found if f[1] in supported_set]
+        if not matches:
+            print(f"[APKMirror] None of the {len(found)} releases on this page "
+                  f"matches the supported-version list.")
+            print(f"[APKMirror]   supported:  {sorted(supported_set, key=_parse_version_tuple, reverse=True)}")
+            print(f"[APKMirror]   on page:    {page_versions}")
+            return None, None
+        matches.sort(key=lambda x: x[2], reverse=True)
+        best_link, best_ver, _ = matches[0]
+        print(f"[APKMirror] Found {len(matches)} supported release(s) "
+              f"(of {len(found)} on page). Picked highest supported version: {best_ver}")
+        return best_link, best_ver
+
+    # No filter — keep the original behaviour.
     found.sort(key=lambda x: x[2], reverse=True)
     best_link, best_ver, _ = found[0]
     print(f"[APKMirror] Found {len(found)} releases on page. Picked highest semantic version: {best_ver}")
     return best_link, best_ver
-
 
 
 def _find_download_page_link(detail_soup):
@@ -186,7 +267,8 @@ def _find_final_link(dl_soup, dl_html):
 # Path 1: direct HTTP (fast, may fail with 403 on CI datacenter IPs)
 # ---------------------------------------------------------------------------
 
-def get_apkmirror_apk(variant_url, output_path, check_version_only=False):
+def get_apkmirror_apk(variant_url, output_path, check_version_only=False,
+                      supported_versions=None):
     print(f"[direct] Fetching: {variant_url}")
     if HAS_CURL_CFFI:
         session = cffi_requests.Session(impersonate="chrome131")
@@ -194,14 +276,14 @@ def get_apkmirror_apk(variant_url, output_path, check_version_only=False):
         if resp.status_code != 200:
             raise Exception(f"HTTP Error {resp.status_code}: {resp.reason}")
         soup = BeautifulSoup(resp.text, "html.parser")
-        detail_link, version_str = _find_detail_link(soup)
+        detail_link, version_str = _find_detail_link(soup, supported_versions)
         if check_version_only:
             if not version_str:
-                raise Exception("Could not determine version from APKMirror variant page.")
+                raise Exception("Could not determine a supported version from APKMirror variant page.")
             print(f"LATEST_VERSION={version_str}")
             return version_str
         if not detail_link:
-            raise Exception("Could not find download link on APKMirror variant page.")
+            raise Exception("Could not find a supported download link on APKMirror variant page.")
 
         print(f"[direct] Detail page: {detail_link}")
         resp2 = session.get(detail_link, headers=HEADERS, timeout=30)
@@ -231,14 +313,14 @@ def get_apkmirror_apk(variant_url, output_path, check_version_only=False):
     else:
         html = fetch_url(variant_url).decode("utf-8")
         soup = BeautifulSoup(html, "html.parser")
-        detail_link, version_str = _find_detail_link(soup)
+        detail_link, version_str = _find_detail_link(soup, supported_versions)
         if check_version_only:
             if not version_str:
-                raise Exception("Could not determine version from APKMirror variant page.")
+                raise Exception("Could not determine a supported version from APKMirror variant page.")
             print(f"LATEST_VERSION={version_str}")
             return version_str
         if not detail_link:
-            raise Exception("Could not find download link on APKMirror variant page.")
+            raise Exception("Could not find a supported download link on APKMirror variant page.")
 
         print(f"[direct] Detail page: {detail_link}")
         detail_html = fetch_url(detail_link).decode("utf-8")
@@ -258,7 +340,6 @@ def get_apkmirror_apk(variant_url, output_path, check_version_only=False):
         download_file(final_link, output_path, extra_headers={"Referer": dl_page})
         return version_str
 
-
 # ---------------------------------------------------------------------------
 # Path 2: Playwright (headless Chromium — solves Cloudflare JS challenge)
 # ---------------------------------------------------------------------------
@@ -275,7 +356,8 @@ def _pw_wait_for_cf(page, timeout=30000):
     page.wait_for_timeout(2000)
 
 
-def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=False):
+def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=False,
+                                 supported_versions=None):
     from playwright.sync_api import sync_playwright
 
     print("[playwright] Launching headless Chromium to bypass Cloudflare...")
@@ -308,16 +390,16 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
             _pw_wait_for_cf(page)
 
             soup = BeautifulSoup(page.content(), "html.parser")
-            detail_link, version_str = _find_detail_link(soup)
+            detail_link, version_str = _find_detail_link(soup, supported_versions)
 
             if check_version_only:
                 if not version_str:
-                    raise Exception("[playwright] Could not determine version.")
+                    raise Exception("[playwright] Could not determine a supported version.")
                 print(f"LATEST_VERSION={version_str}")
                 return version_str
 
             if not detail_link:
-                raise Exception("[playwright] Could not find download link on APKMirror variant page.")
+                raise Exception("[playwright] Could not find a supported download link on APKMirror variant page.")
 
             # Step 2: APK detail page
             print(f"[playwright] → {detail_link}")
@@ -349,7 +431,7 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
                     a_tag.click()
                 else:
                     page.evaluate(f"window.location.href = {json.dumps(final_link)}")
-            
+
             download = dl_info.value
             print(f"[playwright] Saving APK ({download.suggested_filename}) to: {output_path}")
             download.save_as(output_path)
@@ -357,60 +439,145 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
         finally:
             browser.close()
 
+# ---------------------------------------------------------------------------
+# Env-file writers
+# ---------------------------------------------------------------------------
 
+def _write_github_output(version_str):
+    if "GITHUB_OUTPUT" in os.environ and version_str:
+        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"apk_version={version_str}\n")
+
+
+def _write_github_env(arch_label):
+    if "GITHUB_ENV" in os.environ and arch_label:
+        with open(os.environ["GITHUB_ENV"], "a") as f:
+            f.write(f"APK_ARCH={arch_label}\n")
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-
 def main():
     parser = argparse.ArgumentParser(description="Download Google Photos APK from APKMirror")
     parser.add_argument("--direct-url", type=str, help="Skip scraping; download this URL directly")
-    parser.add_argument("--variant-url", type=str, default=DEFAULT_VARIANT_URL)
+    parser.add_argument(
+        "--variant-url-arm64",
+        type=str,
+        default=ARM64_VARIANT_URL,
+        help="Preferred arm64-v8a-only variant URL. Tried first.",
+    )
+    parser.add_argument(
+        "--variant-url",
+        type=str,
+        default=DEFAULT_VARIANT_URL,
+        help="Fallback universal variant URL (all ABIs).",
+    )
+    parser.add_argument(
+        "--no-arm64-prefer",
+        action="store_true",
+        help="Skip the arm64-only URL and go straight to the universal URL.",
+    )
+    parser.add_argument(
+        "--supported-versions",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of Google Photos version strings the patch bundle "
+            "supports (matches `compatiblePackages`). If omitted, "
+            "DEFAULT_SUPPORTED_VERSIONS is used. Pass an empty string '' to disable "
+            "filtering (equivalent to --allow-any-version)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-any-version",
+        action="store_true",
+        help=(
+            "Disable supported-version filtering and download the highest version "
+            "found on the page. WARNING: may produce 0-patch 'patched' APKs."
+        ),
+    )
     parser.add_argument("--output", type=str, default="google-photos.apk")
     parser.add_argument("--check-version", action="store_true")
-    parser.add_argument("--retries", type=int, default=3, help="Max retry attempts for scraping (default: 3)")
+    parser.add_argument("--retries", type=int, default=3, help="Max retry attempts (default: 3)")
     args = parser.parse_args()
+
+    # Resolve the effective version filter.
+    if args.allow_any_version:
+        supported_versions = None
+        print("[config] Supported-version filter DISABLED — highest available will be used.")
+    else:
+        raw = args.supported_versions
+        if raw is None:
+            supported_versions = list(DEFAULT_SUPPORTED_VERSIONS)
+            print("[config] --supported-versions not given; using DEFAULT_SUPPORTED_VERSIONS.")
+        else:
+            supported_versions = [v.strip() for v in raw.split(",") if v.strip()]
+        if supported_versions:
+            print(f"[config] Supported versions filter: {supported_versions}")
+        else:
+            supported_versions = None
+            print("[config] Supported-version list is empty — filter disabled.")
 
     # ---- direct URL shortcut ----
     if args.direct_url:
         print(f"Downloading direct URL: {args.direct_url}")
         download_file(args.direct_url, args.output)
         version_str = "unknown"
+        arch_label = "unknown"
+        _write_github_env(arch_label)
     else:
         version_str = "unknown"
+        arch_label = "unknown"
         success = False
         last_error = None
+
+        variant_candidates = []
+        if not args.no_arm64_prefer and args.variant_url_arm64:
+            variant_candidates.append(("arm64-v8a", args.variant_url_arm64))
+        variant_candidates.append(("universal", args.variant_url))
+
         for attempt in range(1, args.retries + 1):
-            print(f"\n=== Download attempt {attempt}/{args.retries} ===")
-            # Try fast path first, fall back to Playwright
-            try:
-                if args.check_version:
-                    get_apkmirror_apk(args.variant_url, None, check_version_only=True)
-                    return
-                version_str = get_apkmirror_apk(args.variant_url, args.output)
-                if os.path.exists(args.output) and os.path.getsize(args.output) > 1_000_000:
-                    success = True
-                    break
-            except Exception as e:
-                print(f"[Attempt {attempt}] Direct scrape failed: {e}")
-                last_error = e
+            for label, url in variant_candidates:
+                print(f"\n=== Download attempt {attempt}/{args.retries} — {label} variant ===")
 
-            # Fall back to Playwright if direct failed
-            try:
-                print(f"[Attempt {attempt}] Retrying with Playwright…")
-                if args.check_version:
-                    get_apkmirror_apk_playwright(args.variant_url, None, check_version_only=True)
-                    return
-                version_str = get_apkmirror_apk_playwright(args.variant_url, args.output)
-                if os.path.exists(args.output) and os.path.getsize(args.output) > 1_000_000:
-                    success = True
-                    break
-            except Exception as e2:
-                print(f"[Attempt {attempt}] Playwright scrape failed: {e2}")
-                last_error = e2
+                # ---- fast path: direct HTTP ----
+                try:
+                    version_str = get_apkmirror_apk(
+                        url, args.output,
+                        check_version_only=args.check_version,
+                        supported_versions=supported_versions,
+                    )
+                    if args.check_version:
+                        return
+                    if os.path.exists(args.output) and os.path.getsize(args.output) > 1_000_000:
+                        arch_label = "arm64-only" if label == "arm64-v8a" else "universal"
+                        success = True
+                        break
+                except Exception as e:
+                    print(f"[Attempt {attempt}] Direct scrape of {label} variant failed: {e}")
+                    last_error = e
 
+                # ---- slow path: Playwright ----
+                try:
+                    print(f"[Attempt {attempt}] Retrying {label} variant with Playwright…")
+                    version_str = get_apkmirror_apk_playwright(
+                        url, args.output,
+                        check_version_only=args.check_version,
+                        supported_versions=supported_versions,
+                    )
+                    if args.check_version:
+                        return
+                    if os.path.exists(args.output) and os.path.getsize(args.output) > 1_000_000:
+                        arch_label = "arm64-only" if label == "arm64-v8a" else "universal"
+                        success = True
+                        break
+                except Exception as e2:
+                    print(f"[Attempt {attempt}] Playwright scrape of {label} variant failed: {e2}")
+                    last_error = e2
+
+            if success:
+                break
             if attempt < args.retries:
                 backoff = 10 * attempt
                 print(f"Waiting {backoff}s before next attempt...")
@@ -418,6 +585,12 @@ def main():
 
         if not success and not args.check_version:
             print(f"\nAll {args.retries} download attempts failed! Last error: {last_error}")
+            if supported_versions:
+                print(
+                    "Hint: if none of the supported versions is on the APKMirror variant page, "
+                    "either extend the supported list or run with --allow-any-version "
+                    "(which may produce unpatched APKs)."
+                )
             print("Pass --direct-url or trigger the workflow with a direct APK link.")
             sys.exit(1)
 
@@ -425,11 +598,10 @@ def main():
     if os.path.exists(args.output) and os.path.getsize(args.output) > 1_000_000:
         print(
             f"Successfully downloaded {args.output} "
-            f"({os.path.getsize(args.output):,} bytes)"
+            f"({os.path.getsize(args.output):,} bytes) [arch={arch_label}]"
         )
-        if "GITHUB_OUTPUT" in os.environ and version_str:
-            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                f.write(f"apk_version={version_str}\n")
+        _write_github_output(version_str)
+        _write_github_env(arch_label)
     else:
         print("Downloaded file is missing or too small!")
         sys.exit(1)
